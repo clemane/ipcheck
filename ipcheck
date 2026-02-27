@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""ipcheck — All your network info at a glance."""
+
+import json
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+# Colors
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+CYAN = "\033[36m"
+RED = "\033[31m"
+MAGENTA = "\033[35m"
+
+
+def _fetch_json(url: str, timeout: int = 5) -> dict | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def _run(cmd: list[str], timeout: int = 5) -> str | None:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _ping_latency(host: str = "google.com") -> str:
+    output = _run(["ping", "-c", "3", "-W", "2", host], timeout=10)
+    if output:
+        for line in output.splitlines():
+            if "avg" in line or "moy" in line:
+                parts = line.split("/")
+                if len(parts) >= 5:
+                    return f"{float(parts[4]):.1f}ms"
+    return "—"
+
+
+def _get_dns_server() -> str:
+    known = {
+        "8.8.8.8": "Google", "8.8.4.4": "Google",
+        "1.1.1.1": "Cloudflare", "1.0.0.1": "Cloudflare",
+        "9.9.9.9": "Quad9",
+        "208.67.222.222": "OpenDNS", "208.67.220.220": "OpenDNS",
+        "127.0.0.53": "systemd-resolved",
+    }
+    # Get configured DNS from resolv.conf
+    local_dns = None
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                if line.strip().startswith("nameserver"):
+                    local_dns = line.strip().split()[1]
+                    break
+    except Exception:
+        pass
+
+    # Get the public DNS resolver via whoami query
+    public_dns = _run(["dig", "+short", "whoami.akamai.net", "@ns1-1.akamaitech.net"], timeout=5)
+
+    if local_dns and public_dns and public_dns != local_dns:
+        name = known.get(public_dns, "")
+        public_label = f"{public_dns} ({name})" if name else public_dns
+        return f"{local_dns} → {public_label}"
+    if local_dns:
+        name = known.get(local_dns, "")
+        return f"{local_dns} ({name})" if name else local_dns
+    return "—"
+
+
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        addr = s.getsockname()[0]
+        s.close()
+        return f"{BOLD}{addr}{RESET}"
+    except Exception:
+        return "—"
+
+
+def _get_ipv6() -> str:
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("2001:4860:4860::8888", 80))
+        addr = s.getsockname()[0]
+        s.close()
+        return addr
+    except Exception:
+        return "Non disponible"
+
+
+def _detect_vpn() -> str:
+    # Check common VPN interfaces
+    output = _run(["ip", "link", "show"])
+    if output:
+        vpn_interfaces = ("tun", "tap", "wg", "nordlynx", "proton", "mullvad")
+        for line in output.splitlines():
+            for iface in vpn_interfaces:
+                if iface in line.lower() and "UP" in line:
+                    return f"{GREEN}Oui{RESET} ({iface})"
+    return f"{DIM}Non détecté{RESET}"
+
+
+def _speed_test_download() -> str:
+    """Download speed test using Cloudflare CDN (close servers worldwide)."""
+    url = "https://speed.cloudflare.com/__down?bytes=25000000"  # 25MB
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        start = time.monotonic()
+        total = 0
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+        elapsed = time.monotonic() - start
+        mbps = (total * 8 / elapsed) / 1_000_000
+        return f"{mbps:.1f} Mbps"
+    except Exception:
+        return "—"
+
+
+def _speed_test_upload() -> str:
+    """Upload speed test using Cloudflare CDN."""
+    payload = b"0" * 10_000_000  # 10MB
+    try:
+        req = urllib.request.Request(
+            "https://speed.cloudflare.com/__up",
+            data=payload,
+            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/octet-stream"},
+        )
+        start = time.monotonic()
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+        elapsed = time.monotonic() - start
+        mbps = (len(payload) * 8 / elapsed) / 1_000_000
+        return f"{mbps:.1f} Mbps"
+    except Exception:
+        return "—"
+
+
+def _speed_test() -> tuple[str, str]:
+    """Speed test using Cloudflare CDN for accurate results."""
+    down = _speed_test_download()
+    up = _speed_test_upload()
+    return down, up
+
+
+def _print_row(label: str, value: str, color: str = CYAN) -> None:
+    print(f"  {color}{BOLD}{label:<16}{RESET} {value}")
+
+
+def main() -> None:
+    speed_test = "--speed" in sys.argv
+
+    print()
+    print(f"  {BOLD}{MAGENTA}╔══════════════════════════════════╗{RESET}")
+    print(f"  {BOLD}{MAGENTA}║         {CYAN}ip{RESET}{BOLD}check{MAGENTA}  v1.0            ║{RESET}")
+    print(f"  {BOLD}{MAGENTA}╚══════════════════════════════════╝{RESET}")
+    print()
+
+    # Fetch IP info
+    info = _fetch_json("https://ipinfo.io/json")
+
+    if info:
+        _print_row("IP publique", f"{BOLD}{info.get('ip', '—')}{RESET}")
+    else:
+        # Fallback
+        ip = _run(["curl", "-s", "ifconfig.me"])
+        _print_row("IP publique", f"{BOLD}{ip or '—'}{RESET}")
+
+    _print_row("IP locale", _get_local_ip())
+    _print_row("IPv6", _get_ipv6())
+
+    if info:
+        city = info.get("city", "")
+        region = info.get("region", "")
+        country = info.get("country", "")
+        loc = ", ".join(filter(None, [city, region, country]))
+        _print_row("Localisation", f"{GREEN}{loc}{RESET}")
+
+        org = info.get("org", "—")
+        _print_row("FAI", org)
+
+    _print_row("DNS", _get_dns_server())
+    _print_row("VPN", _detect_vpn())
+
+    print(f"  {DIM}{'─' * 36}{RESET}")
+
+    latency = _ping_latency()
+    color = GREEN if latency != "—" and float(latency.replace("ms", "")) < 50 else YELLOW
+    _print_row("Latence", f"{color}{latency}{RESET} {DIM}(google.com){RESET}")
+
+    if speed_test:
+        print(f"  {DIM}Test de débit en cours...{RESET}", end="\r")
+        down, up = _speed_test()
+        print(f"  {' ' * 40}", end="\r")  # Clear line
+        _print_row("Débit ↓", f"{GREEN}{down}{RESET}")
+        _print_row("Débit ↑", f"{BLUE}{up}{RESET}")
+    else:
+        print(f"  {DIM}  Ajoute --speed pour tester le débit{RESET}")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
